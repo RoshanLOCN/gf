@@ -145,8 +145,8 @@ class BlockingProbability:
         self.col = self.core * self.mode * 2  # counter-prop: forward + backward
         self.edgeList = edgelist
         self.adj_mat = [[0] * self.col for _ in range(self.col)]
+        self.int_list = list(adj_m)   # must be set before _create_edges
         self._create_edges()
-        self.int_list = list(adj_m)
         self.store = store
         self.matrix: Optional[np.ndarray] = None  # scratch (slot, col) for RandomFitfillAdj
 
@@ -177,39 +177,51 @@ class BlockingProbability:
             r, c = edge[0], edge[1]
             if r < self.col and c < self.col:
                 self.adj_mat[r][c] = 1
+        # XT adjacency from consecutive int_list (1,2) pairs.  Rows j and j+1
+        # are XT-adjacent when one carries value 1 and the other value 2 in the
+        # pattern [0,1,2,0,1,2,...].  Without this, rows outside the edgelist
+        # range are unconstrained and the state space explodes.
+        for j in range(len(self.int_list) - 1):
+            v1, v2 = self.int_list[j], self.int_list[j + 1]
+            if v1 != 0 and v2 != 0 and v1 != v2 and j + 1 < self.col:
+                self.adj_mat[j][j + 1] = 1
+                self.adj_mat[j + 1][j] = 1
 
     # ---------- RF cross-row XT primitive ----------
     # 'self.matrix' is the transposed state shaped (slot, col).
     # 'row' here is a SLOT index, 'col' is the LIGHTPATH/row index.
+
+    def _mark_xt_and_guard(self, row: int, size: int, flip: bool, c: int):
+        """Mark XT slots AND 1-slot guard bands in adjacent column c.
+
+        XT zone  : size slots starting at 'row' (direction depends on flip).
+        Guard band: 1 slot before the first XT slot and 1 slot after the last,
+                    following the XT adjacency defined by adj_m (int_list)."""
+        for i in range(size):
+            rr = row - i if flip else row + i
+            if 0 <= rr < self.slot and self.matrix[rr][c] != 1:
+                self.matrix[rr][c] = -1
+        # 1-slot guard band on each side of the XT zone.
+        rr_before = (row + 1) if flip else (row - 1)
+        if 0 <= rr_before < self.slot and self.matrix[rr_before][c] == 0:
+            self.matrix[rr_before][c] = -1
+        rr_after = (row - size) if flip else (row + size)
+        if 0 <= rr_after < self.slot and self.matrix[rr_after][c] == 0:
+            self.matrix[rr_after][c] = -1
+
     def RandomFitfillAdj(self, row: int, col: int, size: int, flip: bool):
+        """Mark XT + guard-band slots in every row that is XT-adjacent to 'col'.
+
+        The original code only examined higher-indexed neighbours, causing
+        asymmetric marking: placing in a lastCoreCol row never marked the
+        lower-indexed partner, so states with both adjacent rows occupied
+        were reachable and the state space exploded.  Iterating over all
+        adj_mat entries fixes the asymmetry without changing the semantics."""
         if col >= self.col:
             return
-        coreCol = self.isLastCoreCol(col)
-        if coreCol:
-            for j in range(1, self.core):
-                c = col + j * self.mode
-                if c >= self.col:
-                    break
-                if self.isAdj(col, c):
-                    for i in range(size):
-                        rr = row - i if flip else row + i
-                        if 0 <= rr < self.slot and self.matrix[rr][c] != 1:
-                            self.matrix[rr][c] = -1
-        else:
-            if col + 1 < self.col and self.isAdj(col, col + 1):
-                for i in range(size):
-                    rr = row - i if flip else row + i
-                    if 0 <= rr < self.slot and self.matrix[rr][col + 1] != 1:
-                        self.matrix[rr][col + 1] = -1
-            for j in range(1, self.core):
-                c = col + j * self.mode
-                if c >= self.col:
-                    break
-                if self.isAdj(col, c):
-                    for i in range(size):
-                        rr = row - i if flip else row + i
-                        if 0 <= rr < self.slot and self.matrix[rr][c] != 1:
-                            self.matrix[rr][c] = -1
+        for c in range(self.col):
+            if c != col and self.isAdj(col, c):
+                self._mark_xt_and_guard(row, size, flip, c)
 
     # ---------- RF placement primitive ----------
     def _rf_apply_placement(self, state: np.ndarray, j: int, slot_start: int, x: int) -> np.ndarray:
@@ -217,14 +229,8 @@ class BlockingProbability:
         Returns a new contiguous (col, slot) int8 array."""
         tmp = state.copy()
         tmp[j, slot_start:slot_start + x] = 1
-        # Same-row guard band for XT-adjacent rows (int_list != 0, e.g. values 1,2
-        # in the pattern [0,1,2,0,1,2,...]).  One guard slot on each side of the
-        # allocation prevents directly back-to-back placements on interfering rows.
-        if j < len(self.int_list) and self.int_list[j] != 0:
-            if slot_start > 0 and tmp[j, slot_start - 1] == 0:
-                tmp[j, slot_start - 1] = -1
-            if slot_start + x < self.slot and tmp[j, slot_start + x] == 0:
-                tmp[j, slot_start + x] = -1
+        # Guard bands are cross-row only: _mark_xt_and_guard adds ±1 guard slots
+        # in XT-adjacent rows via RandomFitfillAdj below.
         A = np.ascontiguousarray(tmp.T, dtype=np.int8)
         saved = self.matrix
         try:
@@ -467,9 +473,7 @@ class BlockingProbability:
                 return None
             blocks_to_replay.append((r_idx, avail[cursor], blen))
             cursor += blen
-            # Guard-band gap only for XT-adjacent (interfering) rows, matching
-            # the same-row guard band applied during RF placement.
-            if cursor < len(avail) and self._row_is_interfering(r_idx):
+            if cursor < len(avail):
                 cursor += 1
 
         placed_k = False
