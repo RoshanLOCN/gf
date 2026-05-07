@@ -217,7 +217,14 @@ class BlockingProbability:
         Returns a new contiguous (col, slot) int8 array."""
         tmp = state.copy()
         tmp[j, slot_start:slot_start + x] = 1
-        # No same-row guard band: -1 comes only from cross-row XT via RandomFitfillAdj.
+        # Same-row guard band for XT-adjacent rows (int_list != 0, e.g. values 1,2
+        # in the pattern [0,1,2,0,1,2,...]).  One guard slot on each side of the
+        # allocation prevents directly back-to-back placements on interfering rows.
+        if j < len(self.int_list) and self.int_list[j] != 0:
+            if slot_start > 0 and tmp[j, slot_start - 1] == 0:
+                tmp[j, slot_start - 1] = -1
+            if slot_start + x < self.slot and tmp[j, slot_start + x] == 0:
+                tmp[j, slot_start + x] = -1
         A = np.ascontiguousarray(tmp.T, dtype=np.int8)
         saved = self.matrix
         try:
@@ -460,7 +467,9 @@ class BlockingProbability:
                 return None
             blocks_to_replay.append((r_idx, avail[cursor], blen))
             cursor += blen
-            if cursor < len(avail):
+            # Guard-band gap only for XT-adjacent (interfering) rows, matching
+            # the same-row guard band applied during RF placement.
+            if cursor < len(avail) and self._row_is_interfering(r_idx):
                 cursor += 1
 
         placed_k = False
