@@ -22,7 +22,7 @@ import numpy as np
 
 try:
     from scipy.sparse import csr_matrix
-    from scipy.sparse.linalg import lsqr, spsolve
+    from scipy.sparse.linalg import lsqr, spsolve, lgmres, LinearOperator
     _HAS_SCIPY = True
 except Exception:
     _HAS_SCIPY = False
@@ -147,11 +147,13 @@ class BlockingProbability:
         self.adj_mat = [[0] * self.col for _ in range(self.col)]
         self.int_list = list(adj_m)   # must be set before _create_edges
         self._create_edges()
+        # Precompute per-row adjacency list for O(degree) RandomFitfillAdj.
+        self._adj_rows: List[List[int]] = [
+            [c for c in range(self.col) if self.adj_mat[j][c] == 1]
+            for j in range(self.col)
+        ]
         self.store = store
         self.matrix: Optional[np.ndarray] = None  # scratch (slot, col) for RandomFitfillAdj
-
-        # Precompute last-column-of-core set for O(1) isLastCoreCol lookup.
-        self._last_core_col_set = {i * self.mode - 1 for i in range(1, self.core + 1)}
 
         self._count_out: Optional[List[Dict[int, int]]] = None
         self._last_P: Optional[np.ndarray] = None
@@ -165,10 +167,10 @@ class BlockingProbability:
         self._last_P_defrag: float = 0.0
         self._last_mean_retune_time: float = 0.0
 
-    # ---------- adjacency helpers ----------
-    def isLastCoreCol(self, col: int) -> bool:
-        return col in self._last_core_col_set
+        # Precomputed CTMC structure (populated by precompute_ctmc()).
+        self._ctmc_ready: bool = False
 
+    # ---------- adjacency helpers ----------
     def isAdj(self, c1: int, c2: int) -> bool:
         return self.adj_mat[c1][c2] == 1
 
@@ -210,18 +212,12 @@ class BlockingProbability:
             self.matrix[rr_after][c] = -1
 
     def RandomFitfillAdj(self, row: int, col: int, size: int, flip: bool):
-        """Mark XT + guard-band slots in every row that is XT-adjacent to 'col'.
-
-        The original code only examined higher-indexed neighbours, causing
-        asymmetric marking: placing in a lastCoreCol row never marked the
-        lower-indexed partner, so states with both adjacent rows occupied
-        were reachable and the state space exploded.  Iterating over all
-        adj_mat entries fixes the asymmetry without changing the semantics."""
+        """Mark XT + guard-band slots in every row XT-adjacent to 'col'.
+        Uses the precomputed _adj_rows list to avoid scanning all columns."""
         if col >= self.col:
             return
-        for c in range(self.col):
-            if c != col and self.isAdj(col, c):
-                self._mark_xt_and_guard(row, size, flip, c)
+        for c in self._adj_rows[col]:
+            self._mark_xt_and_guard(row, size, flip, c)
 
     # ---------- RF placement primitive ----------
     def _rf_apply_placement(self, state: np.ndarray, j: int, slot_start: int, x: int) -> np.ndarray:
@@ -342,29 +338,51 @@ class BlockingProbability:
             A[r, c] += v
         return A
 
-    # ---------- linear solver (direct preferred over iterative) ----------
+    # ---------- linear solver ----------
     def _solve_stationary(self, A) -> np.ndarray:
-        """Solve Ax = b (with last row replaced by normalisation π·1 = 1)."""
+        """Solve for stationary distribution π (normalisation π·1 = 1).
+
+        Uses matrix-free lgmres: the last balance equation is replaced by
+        sum(π)=1 inside the matvec, so Q's sparsity is fully preserved and
+        SuperLU never sees the dense normalisation row.  Falls back to direct
+        spsolve with a dense last row if lgmres fails."""
         if _HAS_SCIPY:
             if not hasattr(A, 'tocsr'):
                 A = csr_matrix(A)
             n = A.shape[0]
-            A = A.tolil()
-            A[-1, :] = 1.0
-            A = A.tocsr()
+            A_csr = A.tocsr()
             b = np.zeros(n, dtype=np.float64)
             b[-1] = 1.0
+
+            def _mv(x):
+                y = A_csr.dot(x)
+                y[-1] = x.sum()          # replace last balance eq with sum=1
+                return y
+
+            A_op = LinearOperator((n, n), matvec=_mv, dtype=np.float64)
             try:
-                P = spsolve(A, b)
+                P, info = lgmres(A_op, b, atol=1e-10, rtol=1e-10, maxiter=500)
+                if info == 0 and np.all(np.isfinite(P)):
+                    P = np.maximum(P, 0.0)
+                    s = P.sum()
+                    return (P / s) if (s > 0 and np.isfinite(s)) else np.ones(n) / n
+            except Exception:
+                pass
+
+            # Fallback: dense-row direct solve.
+            Ad = A_csr.tolil()
+            Ad[-1, :] = 1.0
+            Ad = Ad.tocsr()
+            try:
+                P = spsolve(Ad, b)
                 if np.all(np.isfinite(P)):
                     P = np.maximum(P, 0.0)
                     s = P.sum()
                     return (P / s) if (s > 0 and np.isfinite(s)) else np.ones(n) / n
             except Exception:
                 pass
-            # Fall back to iterative LSQR for ill-conditioned systems.
             it_lim = max(50, SOLVER_LSQR_IT_FACTOR * n)
-            P = lsqr(A, b, atol=1e-10, btol=1e-10, iter_lim=it_lim)[0]
+            P = lsqr(Ad, b, atol=1e-10, btol=1e-10, iter_lim=it_lim)[0]
         else:
             A = np.asarray(A, dtype=np.float64).copy() if not hasattr(A, 'toarray') else A.toarray()
             n = A.shape[0]
@@ -654,41 +672,142 @@ class BlockingProbability:
         r = N2 / (self.core * self.mode * self.slot * 2)
         return b_p, r
 
+    # ---------- CTMC structure precomputation (call once after enumeration) ----------
+    def precompute_ctmc(self, count_out, count_inc, transitionInc) -> None:
+        """Precompute the static CTMC sparse structure.
+
+        The sparsity pattern and coefficient multipliers are determined entirely
+        by the state graph; only λ/µ values change between load points.
+        Call once after randomFit (and defrag), then use _build_ctmc_fast()
+        instead of _build_ctmc_matrix() for each load point.
+        """
+        n = len(self.store)
+        nc = len(self.classes)
+        class_to_idx = {cls: i for i, cls in enumerate(self.classes)}
+
+        rows_od: List[int] = []   # off-diagonal row indices
+        cols_od: List[int] = []   # off-diagonal col indices
+        cidx_od: List[int] = []   # class index for each entry
+        coeff_od: List[float] = []# coefficient (includes ±1 and 1/n_pos)
+        is_arr: List[bool] = []   # True → multiply by λ_k; False → µ_k
+
+        # diag_arr[d, ci]: arrival outflow coefficient  → λ_ci
+        # diag_dep[d, ci]: departure outflow coefficient → µ_ci
+        diag_arr = np.zeros((n, nc), dtype=np.float64)
+        diag_dep = np.zeros((n, nc), dtype=np.float64)
+
+        for d in range(n):
+            for k in count_out[d]:
+                diag_arr[d, class_to_idx[k]] += 1.0
+
+            if d in transitionInc:
+                for k, sources in transitionInc[d].items():
+                    ci = class_to_idx[k]
+                    diag_dep[d, ci] += len(sources)
+                    for s in sources:
+                        rows_od.append(s); cols_od.append(d)
+                        cidx_od.append(ci); coeff_od.append(-1.0); is_arr.append(False)
+                        n_pos = len(count_inc[s].get(k, []))
+                        if n_pos > 0:
+                            rows_od.append(d); cols_od.append(s)
+                            cidx_od.append(ci)
+                            coeff_od.append(-1.0 / n_pos)
+                            is_arr.append(True)
+
+        self._ctmc_rows = np.array(rows_od, dtype=np.int32)
+        self._ctmc_cols = np.array(cols_od, dtype=np.int32)
+        self._ctmc_cidx = np.array(cidx_od, dtype=np.int32)
+        self._ctmc_coeffs = np.array(coeff_od, dtype=np.float64)
+        self._ctmc_is_arr = np.array(is_arr, dtype=bool)
+        self._ctmc_diag_arr = diag_arr   # (n, nc)
+        self._ctmc_diag_dep = diag_dep   # (n, nc)
+        self._ctmc_n = n
+
+        # Blocking mask: _blocking[ci, i] = True iff state i has no placement for class ci.
+        self._blocking = np.zeros((nc, n), dtype=bool)
+        for ci, cls in enumerate(self.classes):
+            for i in range(min(n, len(count_out))):
+                self._blocking[ci, i] = (count_out[i].get(cls, 0) == 0)
+            if n > len(count_out):
+                self._blocking[ci, len(count_out):] = True
+
+        self._ctmc_ready = True
+        self._count_out = count_out  # kept for _solve_with_defrag compatibility
+
+    def _build_ctmc_fast(self, lam, mu):
+        """Build CTMC sparse matrix from precomputed structure.
+        All operations are O(nnz) numpy — no Python loops per load point."""
+        lam_arr = np.asarray(lam, dtype=np.float64)
+        mu_arr  = np.asarray(mu,  dtype=np.float64)
+        n = self._ctmc_n
+
+        # Off-diagonal values: arrival entries → λ_k; departure entries → µ_k
+        rates = np.where(self._ctmc_is_arr,
+                         lam_arr[self._ctmc_cidx],
+                         mu_arr[self._ctmc_cidx])
+        v_od = self._ctmc_coeffs * rates
+
+        # Diagonal: arrival outflow (×λ) + departure outflow (×µ)
+        diag = self._ctmc_diag_arr @ lam_arr + self._ctmc_diag_dep @ mu_arr
+
+        idx = np.arange(n, dtype=np.int32)
+        all_r = np.concatenate([self._ctmc_rows, idx])
+        all_c = np.concatenate([self._ctmc_cols, idx])
+        all_v = np.concatenate([v_od, diag])
+
+        if _HAS_SCIPY:
+            return csr_matrix((all_v, (all_r, all_c)), shape=(n, n), dtype=np.float64)
+        A = np.zeros((n, n), dtype=np.float64)
+        np.add.at(A, (all_r, all_c), all_v)
+        return A
+
     # ---------- BP solver ----------
     def calcBP(self, A) -> Tuple[float, float]:
         n = len(self.store)
         P = self._solve_stationary(A)
         self._last_P = P.copy()
-        if self._count_out is None:
-            raise RuntimeError("_count_out not set; call run() first")
-        s = []
-        for cls in self.classes:
-            mask = np.fromiter(
-                (self._count_out[i].get(cls, 0) == 0 if i < len(self._count_out) else True
-                 for i in range(n)),
-                count=n, dtype=bool
-            )
-            s.append(float(P[mask].sum()))
-        N = sum(s[j] * self.lambda_val[j] for j in range(len(s)))
-        D = float(sum(self.lambda_val)) if self.lambda_val else 1.0
-        N2 = sum(((1.0 - s[j]) * self.lambda_val[j] * self.classes[j]) / self.mu_val[j]
-                 for j in range(len(s)))
-        b_p = N / D if D != 0 else 0.0
-        r = N2 / (self.core * self.mode * self.slot * 2)
+
+        lam_arr = np.asarray(self.lambda_val, dtype=np.float64)
+        mu_arr  = np.asarray(self.mu_val,     dtype=np.float64)
+        cls_arr = np.asarray(self.classes,    dtype=np.float64)
+
+        if self._ctmc_ready:
+            s = np.array([float(P[self._blocking[ci, :n]].sum())
+                          for ci in range(len(self.classes))])
+        else:
+            # Fallback: compute blocking mask on the fly.
+            if self._count_out is None:
+                raise RuntimeError("_count_out not set; call run() first")
+            co = self._count_out
+            s = np.array([float(P[np.array([co[i].get(cls, 0) == 0
+                                             if i < len(co) else True
+                                             for i in range(n)], dtype=bool)].sum())
+                          for cls in self.classes])
+
+        D   = float(lam_arr.sum()) or 1.0
+        N   = float((s * lam_arr).sum())
+        N2  = float(((1.0 - s) * lam_arr * cls_arr / mu_arr).sum())
+        b_p = N / D
+        r   = N2 / (self.core * self.mode * self.slot * 2)
         return b_p, r
 
     def run(self, count_out, count_inc, transitionInc) -> Tuple[float, float]:
-        """Solve for the current lambda/mu. Builds the sparse CTMC matrix
-        directly from count_out/count_inc, bypassing EqToMx."""
-        n = len(self.store)
-        if len(count_out) < n:
-            count_out = list(count_out) + [{} for _ in range(n - len(count_out))]
-        if len(count_inc) < n:
-            count_inc = list(count_inc) + [{} for _ in range(n - len(count_inc))]
-        self._count_out = count_out
+        """Solve for the current lambda/mu.
 
-        r_list, c_list, v_list, _ = self._build_ctmc_matrix(count_out, count_inc, transitionInc)
-        A = self._make_sparse_matrix(r_list, c_list, v_list, n)
+        Uses precomputed CTMC structure (O(nnz) numpy ops) when available;
+        falls back to the Python-loop builder otherwise."""
+        n = len(self.store)
+        if not self._ctmc_ready:
+            if len(count_out) < n:
+                count_out = list(count_out) + [{} for _ in range(n - len(count_out))]
+            if len(count_inc) < n:
+                count_inc = list(count_inc) + [{} for _ in range(n - len(count_inc))]
+            self._count_out = count_out
+            r_list, c_list, v_list, _ = self._build_ctmc_matrix(
+                count_out, count_inc, transitionInc)
+            A = self._make_sparse_matrix(r_list, c_list, v_list, n)
+        else:
+            A = self._build_ctmc_fast(self.lambda_val, self.mu_val)
 
         if self.enable_defrag and self.defrag_states:
             return self._solve_with_defrag(A)
@@ -757,11 +876,15 @@ def _run_calculateProb(enable_defrag, mu_d, classes, edgeList,
 
     store.trim()  # release unused buffer capacity
     transitionInc = rf.transitionIncState(count_inc)
+
+    # Precompute CTMC structure once — reused for every load point.
+    rf.precompute_ctmc(count_out, count_inc, transitionInc)
+
     t_setup = time.time() - t0
     print(f"[RF] normal states={len(store)} (was {n_pre}) | defrag states={n_def} "
           f"| setup={t_setup:.2f}s")
 
-    # --- Sweep load points ---
+    # --- Sweep load points (reuse rf; only λ/µ change) ---
     for i in range(load_val):
         scale = i + 1
         lam = [(x + 1) * 0.1 * scale for x in range(len(classes))]
@@ -770,16 +893,13 @@ def _run_calculateProb(enable_defrag, mu_d, classes, edgeList,
         load = sum(ro) / len(ro)
 
         t1 = time.time()
-        rf_run = BlockingProbability(core, mode, slot, classes, edgeList,
-                                     lam, mu, 'rf', store, adj_m,
-                                     mu_d=mu_d, enable_defrag=enable_defrag)
-        rf_run.defrag_states   = rf.defrag_states
-        rf_run.n_defrag_per_uk = rf.n_defrag_per_uk
-        b_p, r_u = rf_run.run(count_out, count_inc, transitionInc)
+        rf.lambda_val = lam
+        rf.mu_val     = mu
+        b_p, r_u = rf.run(count_out, count_inc, transitionInc)
         t_run = time.time() - t1
 
         T_ret = (1.0 / float(mu_d)) if (enable_defrag and mu_d) else 0.0
-        Pd    = rf_run._last_P_defrag if enable_defrag else 0.0
+        Pd    = rf._last_P_defrag if enable_defrag else 0.0
         with open(file_name, 'a') as fF:
             fF.write(','.join(map(str, ['rf', i, load, len(store), n_def,
                                         core, mode, slot, classes,
@@ -790,9 +910,6 @@ def _run_calculateProb(enable_defrag, mu_d, classes, edgeList,
                   f"P_def={Pd:.4e}  [T_retune=1/µd={T_ret:.4f}]  ({t_run:.2f}s)")
         else:
             print(f"  load={load:.2f}  RF: BP={b_p:.6e} U={r_u:.4f}  ({t_run:.2f}s)")
-
-        del rf_run
-        gc.collect()
 
 
 if __name__ == "__main__":
