@@ -709,7 +709,7 @@ def calculateProb(enable_defrag: bool = True, mu_d: float = 50.0,
     if core is None:      core = 3
     if mode is None:      mode = 2
     if slot is None:      slot = 5
-    if adj_m is None:     adj_m = [1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2]
+    if adj_m is None:     adj_m = [1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0]
 
     orig_stdout = sys.stdout
     f = open(log_path, 'w')
