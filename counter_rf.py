@@ -145,6 +145,7 @@ class BlockingProbability:
         self.col = self.core * self.mode * 2  # counter-prop: forward + backward
         self.edgeList = edgelist
         self.adj_mat = [[0] * self.col for _ in range(self.col)]
+        self._create_edges()
         self.int_list = list(adj_m)
         self.store = store
         self.matrix: Optional[np.ndarray] = None  # scratch (slot, col) for RandomFitfillAdj
@@ -170,6 +171,12 @@ class BlockingProbability:
 
     def isAdj(self, c1: int, c2: int) -> bool:
         return self.adj_mat[c1][c2] == 1
+
+    def _create_edges(self):
+        for edge in self.edgeList:
+            r, c = edge[0], edge[1]
+            if r < self.col and c < self.col:
+                self.adj_mat[r][c] = 1
 
     # ---------- RF cross-row XT primitive ----------
     # 'self.matrix' is the transposed state shaped (slot, col).
@@ -210,9 +217,7 @@ class BlockingProbability:
         Returns a new contiguous (col, slot) int8 array."""
         tmp = state.copy()
         tmp[j, slot_start:slot_start + x] = 1
-        if slot_start + x < self.slot:
-            tmp[j, slot_start + x] = -1
-        # Transpose to (slot, col) for RandomFitfillAdj indexing.
+        # No same-row guard band: -1 comes only from cross-row XT via RandomFitfillAdj.
         A = np.ascontiguousarray(tmp.T, dtype=np.int8)
         saved = self.matrix
         try:
@@ -244,19 +249,14 @@ class BlockingProbability:
             for j in range(self.col):
                 row = sc[j]
                 for x in self.classes:
-                    state_check = 0
-                    while state_check + x <= self.slot:
+                    # Try every valid starting position (advance by 1, matching reference).
+                    for state_check in range(self.slot - x + 1):
                         if not (row[state_check:state_check + x] == 0).all():
-                            state_check += 1
-                            continue
-                        if state_check + x < self.slot and row[state_check + x] != 0:
-                            state_check += 1
                             continue
                         out = self._rf_apply_placement(sc, j, state_check, x)
                         ind = self.store.add(out)
                         slotValue[x] = slotValue.get(x, 0) + 1
                         finalT.setdefault(x, []).append(ind)
-                        state_check += x
             slotArr.append(slotValue)
             transitionArr.append(finalT)
             sidx += 1
