@@ -1,0 +1,4 @@
+[config] core=2 mode=1 slot=4 classes=[1] enable_defrag=True mu_d=10.0
+[RF] normal states=4096 (was 4096) | defrag states=0 | setup=0.34s
+  load=0.10  RF: BP=2.244192e-13 U=0.0062 P_def=0.0000e+00  [T_retune=1/µd=0.1000]  (2.16s)
+  load=0.20  RF: BP=5.198289e-11 U=0.0125 P_def=0.0000e+00  [T_retune=1/µd=0.1000]  (2.08s)

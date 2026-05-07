@@ -1,0 +1,3 @@
+policy,ind,load,states_normal,states_defrag,core,mode,slots,classes,blocking_probability,resource_utilization,mean_retuning_time,P_defrag_occupied,time_sec
+rf,0,0.1,4096,0,2,1,4,[1],1.4599345123353003e-14,0.006249999999999909,0.0,0.0,2.661691427230835
+rf,1,0.2,4096,0,2,1,4,[1],4.2312183605522026e-12,0.01249999999994711,0.0,0.0,1.9458155632019043
